@@ -2,6 +2,8 @@
 // JR7 COMMUNITY — BACKEND API SERVER
 // Node.js + Express, ready for Railway
 // ============================================
+// NOTE: Requires Node 18+ (fetch is built-in).
+// Railway uses Node 18 by default — no extra packages needed.
 
 require('dotenv').config();
 const express = require('express');
@@ -94,8 +96,11 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    // IMPORTANT: Railway (backend) + Netlify (frontend) are different domains.
+    // Cross-domain cookies REQUIRE secure:true and sameSite:"none" — always.
+    secure: true,
+    sameSite: "none",
+    httpOnly: true,
     maxAge: 7 * 24 * 60 * 60 * 1000
   },
   name: "jr7.sid"
@@ -120,8 +125,18 @@ function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
-    const adminIds = (process.env.ADMIN_DISCORD_IDS || "").split(",").filter(Boolean);
-    const isAdmin = req.user.role === "owner" || req.user.role === "admin" || req.user.role === "moderator" || adminIds.includes(req.user.discordId);
+    const adminIds = (process.env.ADMIN_DISCORD_IDS || "")
+      .split(",")
+      .map(id => id.trim())
+      .filter(Boolean);
+
+    // If their Discord ID is in ADMIN_DISCORD_IDS, always treat them as owner
+    // even if the DB role hasn't been set yet (handles existing accounts)
+    if (adminIds.length > 0 && req.user.discordId && adminIds.includes(req.user.discordId)) {
+      req.user.role = "owner"; // upgrade in-memory for this request and permanently
+    }
+
+    const isAdmin = ["owner", "admin", "moderator"].includes(req.user.role);
     if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
     next();
   });
@@ -143,22 +158,21 @@ app.post("/v1/auth/register", async (req, res) => {
     DB.users.set(id, user);
     req.session.userId = id;
     res.json({ id, username, email });
-  } catch (err) { console.error("Register error:", err); res.status(500).json({ message: "Registration failed" }); }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.post("/v1/auth/login", async (req, res) => {
   try {
     if (req.body.website) { securityStats.honeypotHits++; return res.status(400).json({ message: "Bot detected" }); }
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ message: "Invalid input" });
     const user = Array.from(DB.users.values()).find(u => u.email === email);
-    if (!user || !user.passwordHash) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
+    if (!user) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     req.session.userId = user.id;
     user.lastActive = new Date().toISOString();
     res.json({ id: user.id, username: user.username, email: user.email });
-  } catch (err) { console.error("Login error:", err); res.status(500).json({ message: "Login failed" }); }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.post("/v1/auth/logout", (req, res) => { req.session.destroy(); res.json({ message: "Logged out" }); });
@@ -167,33 +181,155 @@ app.get("/v1/auth/session", (req, res) => {
   if (!req.session.userId) return res.json({ user: null });
   const user = DB.users.get(req.session.userId);
   if (!user) return res.json({ user: null });
-  res.json({ user: { id: user.id, username: user.username, avatar: user.avatar, role: user.role, clanId: user.clanId } });
+
+  // Re-check admin status on every session call
+  const adminIds = (process.env.ADMIN_DISCORD_IDS || "")
+    .split(",").map(id => id.trim()).filter(Boolean);
+  if (adminIds.length > 0 && user.discordId && adminIds.includes(user.discordId)) {
+    user.role = "owner";
+  }
+
+  res.json({
+    user: {
+      id:        user.id,
+      username:  user.username,
+      avatar:    user.avatar,
+      role:      user.role,
+      clanId:    user.clanId,
+      discordId: user.discordId
+    }
+  });
 });
 
 app.get("/v1/auth/discord/callback", async (req, res) => {
-  req.session.userId = "user_001";
-  res.redirect(process.env.FRONTEND_URL || "/");
+  const { code, error } = req.query;
+  const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
+  // Discord sent back an error (user cancelled, etc.)
+  if (error) {
+    console.error("Discord OAuth error:", error);
+    return res.redirect(`${FRONTEND_URL}?auth_error=discord_denied`);
+  }
+
+  if (!code) {
+    return res.redirect(`${FRONTEND_URL}?auth_error=no_code`);
+  }
+
+  // Check we have the required env vars
+  if (!process.env.DISCORD_CLIENT_ID || !process.env.DISCORD_CLIENT_SECRET) {
+    console.error("Discord OAuth not configured: DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET missing");
+    return res.redirect(`${FRONTEND_URL}?auth_error=not_configured`);
+  }
+
+  try {
+    // ---- Step 1: Exchange the code for an access token ----
+    const REDIRECT_URI = `${process.env.BACKEND_URL || "http://localhost:3000"}/v1/auth/discord/callback`;
+
+    const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id:     process.env.DISCORD_CLIENT_ID,
+        client_secret: process.env.DISCORD_CLIENT_SECRET,
+        grant_type:    "authorization_code",
+        code,
+        redirect_uri:  REDIRECT_URI
+      })
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenRes.ok || tokenData.error) {
+      console.error("Discord token exchange failed:", tokenData);
+      return res.redirect(`${FRONTEND_URL}?auth_error=token_failed`);
+    }
+
+    const accessToken = tokenData.access_token;
+
+    // ---- Step 2: Fetch the Discord user's profile ----
+    const userRes = await fetch("https://discord.com/api/users/@me", {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+
+    const discordUser = await userRes.json();
+
+    if (!userRes.ok || !discordUser.id) {
+      console.error("Discord user fetch failed:", discordUser);
+      return res.redirect(`${FRONTEND_URL}?auth_error=user_fetch_failed`);
+    }
+
+    const discordId = discordUser.id;
+    const username  = discordUser.username;
+    const avatar    = discordUser.avatar
+      ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png`
+      : "";
+
+    // ---- Step 3: Determine if this Discord ID is an admin ----
+    const adminDiscordIds = (process.env.ADMIN_DISCORD_IDS || "")
+      .split(",")
+      .map(id => id.trim())
+      .filter(Boolean);
+
+    const isAdmin = adminDiscordIds.includes(discordId);
+
+    // ---- Step 4: Find existing account or create a new one ----
+    let user = Array.from(DB.users.values()).find(u => u.discordId === discordId);
+
+    if (!user) {
+      // New user — create their account
+      const id = "user_" + uuidv4().slice(0, 8);
+      user = {
+        id,
+        username,
+        email: discordUser.email || null,
+        passwordHash: null,
+        clanId: null,
+        // If their Discord ID is in ADMIN_DISCORD_IDS, make them owner right away
+        role: isAdmin ? "owner" : "member",
+        discordId,
+        avatar,
+        color: "#C8102E",
+        textColor: "#E84060",
+        joinedAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+        kd: 0, wins: 0, losses: 0, winRate: 0,
+        matchesPlayed: 0, mvps: 0, level: 1
+      };
+      DB.users.set(id, user);
+      console.log(`New user created via Discord: ${username} (${discordId})${isAdmin ? " [ADMIN]" : ""}`);
+    } else {
+      // Existing user — refresh their avatar + username from Discord
+      user.username    = username;
+      user.avatar      = avatar;
+      user.lastActive  = new Date().toISOString();
+      // Always re-check admin status in case you added their ID later
+      if (isAdmin && !["owner","admin"].includes(user.role)) {
+        user.role = "owner";
+        console.log(`Upgraded existing user to owner: ${username} (${discordId})`);
+      }
+      console.log(`Existing user logged in via Discord: ${username} (${discordId})`);
+    }
+
+    // ---- Step 5: Set the session ----
+    req.session.userId = user.id;
+    req.session.save((err) => {
+      if (err) {
+        console.error("Session save error:", err);
+        return res.redirect(`${FRONTEND_URL}?auth_error=session_failed`);
+      }
+      // Redirect back to the frontend homepage (or wherever you want)
+      res.redirect(`${FRONTEND_URL}?auth_success=1`);
+    });
+
+  } catch (err) {
+    console.error("Discord OAuth callback error:", err);
+    res.redirect(`${FRONTEND_URL}?auth_error=server_error`);
+  }
 });
 
 // ============================================
 // USER ROUTES
 // ============================================
-// NOTE: this must be registered before /v1/users/:id — otherwise Express
-// matches /v1/users/leaderboard against :id first (treating "leaderboard"
-// as an id) and the route below becomes unreachable.
-app.get("/v1/users/leaderboard", (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = 20;
-  const players = Array.from(DB.users.values())
-    .sort((a, b) => b.winRate - a.winRate)
-    .slice((page - 1) * limit, page * limit)
-    .map(u => {
-      const clan = u.clanId ? DB.clans.get(u.clanId) : null;
-      return { id: u.id, username: u.username, clanTag: clan?.tag || null, role: u.clanId === clan?.captainId ? "Captain" : "Player", wins: u.wins, losses: u.losses, kd: u.kd, winRate: u.winRate, trend: Math.floor(Math.random() * 10) - 3, color: u.color, textColor: u.textColor };
-    });
-  res.json({ players, total: DB.users.size, pages: Math.ceil(DB.users.size / limit) });
-});
-
 app.get("/v1/users/:id", (req, res) => {
   const user = DB.users.get(req.params.id);
   if (!user) return res.status(404).json({ message: "User not found" });
@@ -236,6 +372,19 @@ app.get("/v1/users/:id/stats", (req, res) => {
         date: m.endedAt || m.scheduledAt
       }))
   });
+});
+
+app.get("/v1/users/leaderboard", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = 20;
+  const players = Array.from(DB.users.values())
+    .sort((a, b) => b.winRate - a.winRate)
+    .slice((page - 1) * limit, page * limit)
+    .map(u => {
+      const clan = u.clanId ? DB.clans.get(u.clanId) : null;
+      return { id: u.id, username: u.username, clanTag: clan?.tag || null, role: u.clanId === clan?.captainId ? "Captain" : "Player", wins: u.wins, losses: u.losses, kd: u.kd, winRate: u.winRate, trend: Math.floor(Math.random() * 10) - 3, color: u.color, textColor: u.textColor };
+    });
+  res.json({ players, total: DB.users.size, pages: Math.ceil(DB.users.size / limit) });
 });
 
 // ============================================
@@ -343,14 +492,6 @@ app.post("/v1/matches/:id/escalate", requireAuth, (req, res) => {
 
 app.post("/v1/matches/:id/chat", requireAuth, (req, res) => {
   const { message, type } = req.body;
-  if (!message || typeof message !== "string" || !message.trim()) {
-    return res.status(400).json({ message: "Message is required" });
-  }
-  const match = DB.matches.get(req.params.id);
-  if (!match) return res.status(404).json({ message: "Match not found" });
-  const isParticipant = match.clan1Id === req.user.clanId || match.clan2Id === req.user.clanId;
-  const isReferee = req.user.role === "moderator" || req.user.role === "admin" || req.user.role === "owner";
-  if (!isParticipant && !isReferee) return res.status(403).json({ message: "Not authorized for this match" });
   if (pusher) {
     pusher.trigger(`private-match-${req.params.id}`, "message", {
       message, type: type || "text", username: req.user.username,
@@ -469,20 +610,6 @@ app.get("/v1/admin/clans", requireAdmin, (req, res) => {
 // ============================================
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
-
-// ============================================
-// 404 + ERROR HANDLING (must stay last, after every route above)
-// ============================================
-app.use((req, res) => {
-  res.status(404).json({ message: "Not found" });
-});
-
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  const status = err.status || err.statusCode || 500;
-  const message = status < 500 ? "Invalid request" : "Internal server error";
-  res.status(status).json({ message });
 });
 
 // ============================================

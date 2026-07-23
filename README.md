@@ -22,9 +22,28 @@ Ready-to-deploy Node.js backend for the Jr7 CDL Competitive Platform.
 | `DISCORD_BOT_TOKEN` | No | Same as above → Bot section |
 | `DISCORD_GUILD_ID` | No | Right-click your Discord server → Copy Server ID |
 | `CLOUDINARY_CLOUD_NAME` | No | cloudinary.com/console |
-| `FRONTEND_URL` | **Yes** | Your frontend domain (e.g. `https://jr7community.vercel.app`) |
+| `FRONTEND_URL` | **Yes** | Your Netlify URL, e.g. `https://jr7community.netlify.app` — NO trailing slash |
+| `BACKEND_URL` | **Yes** | Your Railway URL, e.g. `https://jr7-api.up.railway.app` — NO trailing slash |
 | `SESSION_SECRET` | **Yes** | Any random string, 32+ characters |
-| `ADMIN_DISCORD_IDS` | No | Comma-separated Discord user IDs of admins |
+| `ADMIN_DISCORD_IDS` | **Yes** | Your Discord user ID (right-click your profile → Copy User ID). Multiple admins: comma-separated, e.g. `123456789,987654321` |
+
+## Discord Developer Portal Setup (REQUIRED for login to work)
+
+1. Go to **https://discord.com/developers/applications**
+2. Select your app → **OAuth2** tab
+3. Under **Redirects**, add exactly:
+   ```
+   https://YOUR-RAILWAY-URL.up.railway.app/v1/auth/discord/callback
+   ```
+   ⚠️ This must match your `BACKEND_URL` environment variable exactly.
+4. Copy your **Client ID** → paste as `DISCORD_CLIENT_ID`
+5. Reset and copy your **Client Secret** → paste as `DISCORD_CLIENT_SECRET`
+
+## Getting Your Discord User ID (for ADMIN_DISCORD_IDS)
+
+1. Open Discord → Settings → Advanced → Enable **Developer Mode**
+2. Right-click your own profile → **Copy User ID**
+3. Paste that number as `ADMIN_DISCORD_IDS` in Railway
 
 ## API Endpoints
 
