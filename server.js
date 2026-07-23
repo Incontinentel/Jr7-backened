@@ -143,21 +143,22 @@ app.post("/v1/auth/register", async (req, res) => {
     DB.users.set(id, user);
     req.session.userId = id;
     res.json({ id, username, email });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { console.error("Register error:", err); res.status(500).json({ message: "Registration failed" }); }
 });
 
 app.post("/v1/auth/login", async (req, res) => {
   try {
     if (req.body.website) { securityStats.honeypotHits++; return res.status(400).json({ message: "Bot detected" }); }
     const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: "Invalid input" });
     const user = Array.from(DB.users.values()).find(u => u.email === email);
-    if (!user) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
+    if (!user || !user.passwordHash) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     req.session.userId = user.id;
     user.lastActive = new Date().toISOString();
     res.json({ id: user.id, username: user.username, email: user.email });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { console.error("Login error:", err); res.status(500).json({ message: "Login failed" }); }
 });
 
 app.post("/v1/auth/logout", (req, res) => { req.session.destroy(); res.json({ message: "Logged out" }); });
@@ -177,6 +178,22 @@ app.get("/v1/auth/discord/callback", async (req, res) => {
 // ============================================
 // USER ROUTES
 // ============================================
+// NOTE: this must be registered before /v1/users/:id — otherwise Express
+// matches /v1/users/leaderboard against :id first (treating "leaderboard"
+// as an id) and the route below becomes unreachable.
+app.get("/v1/users/leaderboard", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = 20;
+  const players = Array.from(DB.users.values())
+    .sort((a, b) => b.winRate - a.winRate)
+    .slice((page - 1) * limit, page * limit)
+    .map(u => {
+      const clan = u.clanId ? DB.clans.get(u.clanId) : null;
+      return { id: u.id, username: u.username, clanTag: clan?.tag || null, role: u.clanId === clan?.captainId ? "Captain" : "Player", wins: u.wins, losses: u.losses, kd: u.kd, winRate: u.winRate, trend: Math.floor(Math.random() * 10) - 3, color: u.color, textColor: u.textColor };
+    });
+  res.json({ players, total: DB.users.size, pages: Math.ceil(DB.users.size / limit) });
+});
+
 app.get("/v1/users/:id", (req, res) => {
   const user = DB.users.get(req.params.id);
   if (!user) return res.status(404).json({ message: "User not found" });
@@ -219,19 +236,6 @@ app.get("/v1/users/:id/stats", (req, res) => {
         date: m.endedAt || m.scheduledAt
       }))
   });
-});
-
-app.get("/v1/users/leaderboard", (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = 20;
-  const players = Array.from(DB.users.values())
-    .sort((a, b) => b.winRate - a.winRate)
-    .slice((page - 1) * limit, page * limit)
-    .map(u => {
-      const clan = u.clanId ? DB.clans.get(u.clanId) : null;
-      return { id: u.id, username: u.username, clanTag: clan?.tag || null, role: u.clanId === clan?.captainId ? "Captain" : "Player", wins: u.wins, losses: u.losses, kd: u.kd, winRate: u.winRate, trend: Math.floor(Math.random() * 10) - 3, color: u.color, textColor: u.textColor };
-    });
-  res.json({ players, total: DB.users.size, pages: Math.ceil(DB.users.size / limit) });
 });
 
 // ============================================
@@ -339,6 +343,14 @@ app.post("/v1/matches/:id/escalate", requireAuth, (req, res) => {
 
 app.post("/v1/matches/:id/chat", requireAuth, (req, res) => {
   const { message, type } = req.body;
+  if (!message || typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ message: "Message is required" });
+  }
+  const match = DB.matches.get(req.params.id);
+  if (!match) return res.status(404).json({ message: "Match not found" });
+  const isParticipant = match.clan1Id === req.user.clanId || match.clan2Id === req.user.clanId;
+  const isReferee = req.user.role === "moderator" || req.user.role === "admin" || req.user.role === "owner";
+  if (!isParticipant && !isReferee) return res.status(403).json({ message: "Not authorized for this match" });
   if (pusher) {
     pusher.trigger(`private-match-${req.params.id}`, "message", {
       message, type: type || "text", username: req.user.username,
@@ -457,6 +469,20 @@ app.get("/v1/admin/clans", requireAdmin, (req, res) => {
 // ============================================
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// ============================================
+// 404 + ERROR HANDLING (must stay last, after every route above)
+// ============================================
+app.use((req, res) => {
+  res.status(404).json({ message: "Not found" });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  const status = err.status || err.statusCode || 500;
+  const message = status < 500 ? "Invalid request" : "Internal server error";
+  res.status(status).json({ message });
 });
 
 // ============================================
