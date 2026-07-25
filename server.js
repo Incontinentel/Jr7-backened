@@ -2,8 +2,6 @@
 // JR7 COMMUNITY — BACKEND API SERVER
 // Node.js + Express, ready for Railway
 // ============================================
-// NOTE: Requires Node 18+ (fetch is built-in).
-// Railway uses Node 18 by default — no extra packages needed.
 
 require('dotenv').config();
 const express = require('express');
@@ -83,8 +81,24 @@ const pusher = process.env.PUSHER_APP_ID ? new Pusher({
 // ============================================
 // MIDDLEWARE
 // ============================================
+
+// FIX: Allow both Netlify URL and any localhost port for dev
+const allowedOrigins = [
+  "https://jr7cdl.netlify.app",
+  "http://localhost:3000",
+  "http://localhost:5500",
+  "http://127.0.0.1:5500"
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Also allow the FRONTEND_URL env variable
+    if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return callback(null, true);
+    callback(new Error("Not allowed by CORS"));
+  },
   credentials: true
 }));
 
@@ -96,11 +110,8 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    // IMPORTANT: Railway (backend) + Netlify (frontend) are different domains.
-    // Cross-domain cookies REQUIRE secure:true and sameSite:"none" — always.
-    secure: true,
-    sameSite: "none",
-    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     maxAge: 7 * 24 * 60 * 60 * 1000
   },
   name: "jr7.sid"
@@ -125,18 +136,8 @@ function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
-    const adminIds = (process.env.ADMIN_DISCORD_IDS || "")
-      .split(",")
-      .map(id => id.trim())
-      .filter(Boolean);
-
-    // If their Discord ID is in ADMIN_DISCORD_IDS, always treat them as owner
-    // even if the DB role hasn't been set yet (handles existing accounts)
-    if (adminIds.length > 0 && req.user.discordId && adminIds.includes(req.user.discordId)) {
-      req.user.role = "owner"; // upgrade in-memory for this request and permanently
-    }
-
-    const isAdmin = ["owner", "admin", "moderator"].includes(req.user.role);
+    const adminIds = (process.env.ADMIN_DISCORD_IDS || "").split(",").filter(Boolean);
+    const isAdmin = req.user.role === "owner" || req.user.role === "admin" || req.user.role === "moderator" || adminIds.includes(req.user.discordId);
     if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
     next();
   });
@@ -166,7 +167,7 @@ app.post("/v1/auth/login", async (req, res) => {
     if (req.body.website) { securityStats.honeypotHits++; return res.status(400).json({ message: "Bot detected" }); }
     const { email, password } = req.body;
     const user = Array.from(DB.users.values()).find(u => u.email === email);
-    if (!user) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
+    if (!user || !user.passwordHash) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     const valid = await bcrypt.compare(password, user.passwordHash);
     if (!valid) { securityStats.failedLogins++; return res.status(401).json({ message: "Invalid email or password" }); }
     req.session.userId = user.id;
@@ -181,50 +182,28 @@ app.get("/v1/auth/session", (req, res) => {
   if (!req.session.userId) return res.json({ user: null });
   const user = DB.users.get(req.session.userId);
   if (!user) return res.json({ user: null });
-
-  // Re-check admin status on every session call
-  const adminIds = (process.env.ADMIN_DISCORD_IDS || "")
-    .split(",").map(id => id.trim()).filter(Boolean);
-  if (adminIds.length > 0 && user.discordId && adminIds.includes(user.discordId)) {
-    user.role = "owner";
-  }
-
-  res.json({
-    user: {
-      id:        user.id,
-      username:  user.username,
-      avatar:    user.avatar,
-      role:      user.role,
-      clanId:    user.clanId,
-      discordId: user.discordId
-    }
-  });
+  res.json({ user: { id: user.id, username: user.username, avatar: user.avatar, role: user.role, clanId: user.clanId } });
 });
 
+// ============================================
+// DISCORD OAUTH2 CALLBACK — FULLY IMPLEMENTED
+// ============================================
 app.get("/v1/auth/discord/callback", async (req, res) => {
   const { code, error } = req.query;
-  const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+  const frontendUrl = process.env.FRONTEND_URL || "https://jr7cdl.netlify.app";
 
-  // Discord sent back an error (user cancelled, etc.)
+  // Discord denied access
   if (error) {
     console.error("Discord OAuth error:", error);
-    return res.redirect(`${FRONTEND_URL}?auth_error=discord_denied`);
+    return res.redirect(`${frontendUrl}/pages/register.html?error=discord_denied`);
   }
 
   if (!code) {
-    return res.redirect(`${FRONTEND_URL}?auth_error=no_code`);
-  }
-
-  // Check we have the required env vars
-  if (!process.env.DISCORD_CLIENT_ID || !process.env.DISCORD_CLIENT_SECRET) {
-    console.error("Discord OAuth not configured: DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET missing");
-    return res.redirect(`${FRONTEND_URL}?auth_error=not_configured`);
+    return res.redirect(`${frontendUrl}/pages/register.html?error=no_code`);
   }
 
   try {
-    // ---- Step 1: Exchange the code for an access token ----
-    const REDIRECT_URI = `${process.env.BACKEND_URL || "http://localhost:3000"}/v1/auth/discord/callback`;
-
+    // Step 1: Exchange code for access token
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -232,60 +211,61 @@ app.get("/v1/auth/discord/callback", async (req, res) => {
         client_id:     process.env.DISCORD_CLIENT_ID,
         client_secret: process.env.DISCORD_CLIENT_SECRET,
         grant_type:    "authorization_code",
-        code,
-        redirect_uri:  REDIRECT_URI
+        code:          code,
+        redirect_uri:  process.env.DISCORD_REDIRECT_URI || "https://jr7-backened-production.up.railway.app/v1/auth/discord/callback"
       })
     });
 
-    const tokenData = await tokenRes.json();
-
-    if (!tokenRes.ok || tokenData.error) {
-      console.error("Discord token exchange failed:", tokenData);
-      return res.redirect(`${FRONTEND_URL}?auth_error=token_failed`);
+    if (!tokenRes.ok) {
+      const err = await tokenRes.text();
+      console.error("Token exchange failed:", err);
+      return res.redirect(`${frontendUrl}/pages/register.html?error=token_failed`);
     }
 
+    const tokenData = await tokenRes.json();
     const accessToken = tokenData.access_token;
 
-    // ---- Step 2: Fetch the Discord user's profile ----
+    // Step 2: Fetch Discord user info
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
 
-    const discordUser = await userRes.json();
-
-    if (!userRes.ok || !discordUser.id) {
-      console.error("Discord user fetch failed:", discordUser);
-      return res.redirect(`${FRONTEND_URL}?auth_error=user_fetch_failed`);
+    if (!userRes.ok) {
+      console.error("Failed to fetch Discord user");
+      return res.redirect(`${frontendUrl}/pages/register.html?error=user_fetch_failed`);
     }
 
-    const discordId = discordUser.id;
-    const username  = discordUser.username;
-    const avatar    = discordUser.avatar
+    const discordUser = await userRes.json();
+    const discordId   = discordUser.id;
+    const username    = discordUser.username;
+    const email       = discordUser.email;
+    const avatar      = discordUser.avatar
       ? `https://cdn.discordapp.com/avatars/${discordId}/${discordUser.avatar}.png`
       : "";
 
-    // ---- Step 3: Determine if this Discord ID is an admin ----
-    const adminDiscordIds = (process.env.ADMIN_DISCORD_IDS || "")
-      .split(",")
-      .map(id => id.trim())
-      .filter(Boolean);
-
-    const isAdmin = adminDiscordIds.includes(discordId);
-
-    // ---- Step 4: Find existing account or create a new one ----
+    // Step 3: Find or create user in DB
     let user = Array.from(DB.users.values()).find(u => u.discordId === discordId);
 
     if (!user) {
-      // New user — create their account
+      // Also check by email in case they registered with email first
+      user = Array.from(DB.users.values()).find(u => u.email === email);
+    }
+
+    if (user) {
+      // Update existing user's Discord info
+      user.discordId = discordId;
+      user.avatar    = avatar || user.avatar;
+      user.lastActive = new Date().toISOString();
+    } else {
+      // Create new user
       const id = "user_" + uuidv4().slice(0, 8);
       user = {
         id,
         username,
-        email: discordUser.email || null,
+        email: email || `${discordId}@discord.local`,
         passwordHash: null,
         clanId: null,
-        // If their Discord ID is in ADMIN_DISCORD_IDS, make them owner right away
-        role: isAdmin ? "owner" : "member",
+        role: "player",
         discordId,
         avatar,
         color: "#C8102E",
@@ -296,34 +276,17 @@ app.get("/v1/auth/discord/callback", async (req, res) => {
         matchesPlayed: 0, mvps: 0, level: 1
       };
       DB.users.set(id, user);
-      console.log(`New user created via Discord: ${username} (${discordId})${isAdmin ? " [ADMIN]" : ""}`);
-    } else {
-      // Existing user — refresh their avatar + username from Discord
-      user.username    = username;
-      user.avatar      = avatar;
-      user.lastActive  = new Date().toISOString();
-      // Always re-check admin status in case you added their ID later
-      if (isAdmin && !["owner","admin"].includes(user.role)) {
-        user.role = "owner";
-        console.log(`Upgraded existing user to owner: ${username} (${discordId})`);
-      }
-      console.log(`Existing user logged in via Discord: ${username} (${discordId})`);
     }
 
-    // ---- Step 5: Set the session ----
+    // Step 4: Set session
     req.session.userId = user.id;
-    req.session.save((err) => {
-      if (err) {
-        console.error("Session save error:", err);
-        return res.redirect(`${FRONTEND_URL}?auth_error=session_failed`);
-      }
-      // Redirect back to the frontend homepage (or wherever you want)
-      res.redirect(`${FRONTEND_URL}?auth_success=1`);
-    });
+
+    // Step 5: Redirect back to frontend
+    res.redirect(frontendUrl);
 
   } catch (err) {
-    console.error("Discord OAuth callback error:", err);
-    res.redirect(`${FRONTEND_URL}?auth_error=server_error`);
+    console.error("Discord callback error:", err);
+    res.redirect(`${frontendUrl}/pages/register.html?error=server_error`);
   }
 });
 
